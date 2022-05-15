@@ -2,9 +2,12 @@
 
 namespace CatchupThrottling {
     using System.Collections.Generic;
+    using System.Diagnostics;
     using System.Linq;
+    using System.Text;
     using System.Threading;
     using System.Threading.Tasks;
+    using System.Threading.Tasks.Dataflow;
     using EventStore.Client;
 
     public record StreamState {
@@ -20,8 +23,13 @@ namespace CatchupThrottling {
 
         static async Task Main(String[] args) {
             String connection = "esdb://admin:changeit@192.168.10.90:2113?keepAliveInterval=10000&keepAliveTimeout=10000&tls=true&tlsVerifyCert=false";
+            //connection = "esdb://admin:changeit@192.168.10.90:2113?tls=true&tlsVerifyCert=false";
             String stream = "$ce-SalesTransactionAggregate";
-            Int32 numberOfCatchups = 15;
+            Int32 numberOfCatchups = 25;
+            Int32 numberOfConcurrentWriters = 50;
+
+            EventStoreClientSettings settings = EventStoreClientSettings.Create($"{connection}");
+            EventStoreClient client = new(settings);
 
             for (Int32 i = 0; i < numberOfCatchups; i++) {
                 StreamState state = new() {
@@ -31,16 +39,50 @@ namespace CatchupThrottling {
 
                 streamStats.Add(i + 1, state);
 
-                await CatchupTest(connection, stream, state);
+                await CatchupTest(client, stream, state);
+            }
+
+            ActionBlock<String> actionBlock = new(async streamName =>
+                                                  {
+                                                      try{
+                                                          List<EventData> events = GetEvents(10);
+                                                          await client.AppendToStreamAsync(streamName, StreamRevision.None, events);
+                                                      }
+                                                      catch(Exception e){
+                                                          Console.WriteLine(e);
+                                                      }
+                                                  },
+                                                  new ExecutionDataflowBlockOptions {
+                                                                                        MaxDegreeOfParallelism = numberOfConcurrentWriters,
+                                                                                        BoundedCapacity = numberOfConcurrentWriters
+                                                  });
+            
+            while (true){
+                String streamName = $"SalesTransactionAggregate-{Guid.NewGuid().ToString("n")}";
+                await actionBlock.SendAsync(streamName);
             }
 
             Console.ReadKey();
         }
 
-        static async Task CatchupTest(String connectionString, String stream, StreamState state) {
-            EventStoreClientSettings settings = EventStoreClientSettings.Create($"{connectionString}");
-            EventStoreClient client = new (settings);
+        static List<EventData> GetEvents(Int32 count){
+            List<EventData> list = new();
 
+            var payload = new {
+                                  Id = Guid.NewGuid()
+                              };
+
+            String json = Newtonsoft.Json.JsonConvert.SerializeObject(payload);
+            ReadOnlyMemory<Byte> rom = new(Encoding.Default.GetBytes(json));
+
+            for (Int32 i = 0; i < count; i++){
+                list.Add(new(Uuid.FromGuid(Guid.NewGuid()), "someType", rom));
+            }
+
+            return list;
+        }
+
+        static async Task CatchupTest(EventStoreClient client,String stream, StreamState state) {
             await client.SubscribeToStreamAsync(stream,
                                                 FromStream.Start,
                                                 async (sub, @event, can) => await EventAppeared(sub, @event, state.Id, can),
@@ -56,21 +98,21 @@ namespace CatchupThrottling {
             Interlocked.Increment(ref totalEventsProcessed);
 
             //Some processing time.
-            Random random = new(state.GetHashCode());
-            Int32 val = random.Next(0, 10000);
-            Boolean timeout = val switch {
-                0 => true,
-                _ => false
-            };
+            //Random random = new(state.GetHashCode());
+            //Int32 val = random.Next(0, 10000);
+            //Boolean timeout = val switch {
+            //    0 => true,
+            //    _ => false
+            //};
 
-            if (timeout){
-                Console.WriteLine($"Timeout occurred for Id [{state.Id}]");
+            //if (timeout){
+            //    Console.WriteLine($"Timeout occurred for Id [{state.Id}]");
 
-                state = state with
-                        {
-                            NumberOfTimeouts = state.NumberOfTimeouts + 1
-                        };
-            }
+            //    state = state with
+            //            {
+            //                NumberOfTimeouts = state.NumberOfTimeouts + 1
+            //            };
+            //}
 
             state = state with
                     {
@@ -80,15 +122,15 @@ namespace CatchupThrottling {
 
             streamStats[id] = state; //overwrite
 
-            if (timeout){
+            //if (timeout){
                 //This event should timeout.
-                await Task.Delay(TimeSpan.FromSeconds(30), arg3);
-            }
+                //await Task.Delay(TimeSpan.FromSeconds(30), arg3);
+            //}
 
             if ((totalEventsProcessed % 50000) == 0) {
                 //Dump out report
                 streamStats.ToList()
-                           .ForEach(x => Console.WriteLine($"Stream Id [{x.Value.Id}] has processed [{x.Value.EventsProcessed}] events. Last processed [{x.Value.DateTimeOfLastEvent}]. Number of timeouts [{x.Value.NumberOfTimeouts}]"));
+                           .ForEach(x => Console.WriteLine($"Stream Id [{x.Value.Id}] has processed [{x.Value.EventsProcessed}] events. Last processed [{x.Value.DateTimeOfLastEvent}]."));
             }
         }
     }
